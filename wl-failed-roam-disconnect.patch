@@ -1,0 +1,38 @@
+Subject: [PATCH] Report a disconnect when a roam fails
+
+On Linux >= 6.0 a failed join while already associated leaves the
+interface unable to connect again until it is torn down, in practice
+until a reboot.
+
+wl_bss_connect_done() reports the failure with cfg80211_connect_result()
+but never calls cfg80211_disconnected(). Up to 5.19 that was harmless,
+because __cfg80211_connect_result() cleared wdev->current_bss on any
+result. Since the 6.0 MLO rework the state is wdev->connected, which only
+__cfg80211_disconnected() clears. cfg80211_connect() then returns
+-EALREADY for every new connect, and cfg80211_disconnect() does not call
+into the driver because ssid_len is already 0.
+
+When the failed join was a roam away from a live link, report that link
+as disconnected, the same way the WLC_E_LINK down path does.
+---
+--- a/src/wl/sys/wl_cfg80211_hybrid.c
++++ b/src/wl/sys/wl_cfg80211_hybrid.c
+@@ -2555,6 +2555,18 @@
+ 		    conn_info->req_ie_len, conn_info->resp_ie, conn_info->resp_ie_len,
+ 		    completed ? WLAN_STATUS_SUCCESS : WLAN_STATUS_AUTH_TIMEOUT,	GFP_KERNEL);
+ 		WL_DBG(("Connection %s\n", completed ? "Succeeded" : "FAILed"));
++
++		if (!completed && test_and_clear_bit(WL_STATUS_CONNECTED, &wl->status)) {
++			// cfg80211 keeps a failed roam's old link marked connected and rejects every later connect with -EALREADY.
++			WL_ERR(("roam failed, reporting the old link as disconnected\n"));
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4,2,0)
++			cfg80211_disconnected(ndev, 0, NULL, 0, GFP_KERNEL);
++#else
++			cfg80211_disconnected(ndev, 0, NULL, 0, false, GFP_KERNEL);
++#endif
++			wl_link_down(wl);
++			wl_init_prof(wl->profile);
++		}
+ 	}
+ 
+ 	return err;
